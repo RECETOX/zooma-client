@@ -36,6 +36,11 @@ curl -sS "$BASE/v2/api/services/annotate?propertyValue=asthma" \
     -H "Accept: application/json" -o "$DIR/annotate_asthma.json"
 echo "annotate_asthma.json: $(wc -c < "$DIR/annotate_asthma.json") bytes"
 
+# v2 annotate, ontology-restricted (filter=ontologies:[efo] is a hard filter).
+curl -sS "$BASE/v2/api/services/annotate?propertyValue=asthma&filter=ontologies:%5Befo%5D" \
+    -H "Accept: application/json" -o "$DIR/annotate_asthma_efo.json"
+echo "annotate_asthma_efo.json: $(wc -c < "$DIR/annotate_asthma_efo.json") bytes"
+
 # The SPA trap: an unknown path under /spot/zooma/ returns 200 HTML.
 curl -sS "$BASE/v2/health" -o "$DIR/spa_html.html"
 echo "spa_html.html: $(wc -c < "$DIR/spa_html.html") bytes"

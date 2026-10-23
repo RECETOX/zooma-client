@@ -20,6 +20,13 @@ annotations = client.annotate("asthma")
 print(f"annotate('asthma') -> {len(annotations)} annotations, "
       f"first tags: {annotations[0].semantic_tags}")
 
+# Ontology selection in annotate mode (v2 filter parameter).
+filtered = client.annotate("asthma", target_ontologies=["efo"], defining_only=True)
+prefixes = sorted({tag.rsplit("_", 1)[0] for a in filtered for tag in a.semantic_tags})
+print(f"annotate('asthma', target_ontologies=['efo'], defining_only=True) -> "
+      f"{len(filtered)} annotations, tag prefixes: {prefixes}")
+assert prefixes == ["http://www.ebi.ac.uk/efo/EFO"]
+
 print(f"presets: {[p.name for p in client.presets()]}")
 print(f"models with can_embed: {[m.name for m in client.list_models() if m.can_embed]}")
 print("SMOKE TEST OK")

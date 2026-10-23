@@ -7,8 +7,9 @@ The client wraps both generations of the API behind one class:
 * v2 ``GET /v2/api/services/annotate`` — :meth:`Client.annotate` and
   :meth:`Client.annotate_all` return curated annotations, one value per
   request (the endpoint accepts a single ``propertyValue`` and silently
-  ignores every other query parameter, so there is no request batching at
-  this level);
+  ignores *unknown* query parameters, so there is no request batching at
+  this level — but it does honor ``propertyType`` and a ``filter``
+  parameter that supports ontology selection, see :meth:`Client.annotate`);
 
 plus the v3 metadata endpoints (:meth:`Client.presets`,
 :meth:`Client.sources`, :meth:`Client.list_models`) and the only real
@@ -81,6 +82,49 @@ def _discard(message: str) -> None:
 def _check_on_error(on_error: OnError) -> None:
     if on_error not in ("skip", "raise"):
         raise InvalidRequestError(f"on_error must be 'skip' or 'raise', got {on_error!r}")
+
+
+# Characters that would break the v2 filter mini-syntax if they appeared
+# inside a value; see _build_v2_filter.
+_V2_FILTER_FORBIDDEN = ("[", "]", ",")
+
+
+def _v2_filter_values(name: str, values: tuple[str, ...]) -> str:
+    for value in values:
+        if any(char in value for char in _V2_FILTER_FORBIDDEN):
+            raise InvalidRequestError(
+                f"{name} entries must not contain '[', ']' or ',' "
+                f"(got {value!r}); the v2 filter syntax could not represent them"
+            )
+    return ",".join(values)
+
+
+def _build_v2_filter(
+    *,
+    targets: tuple[str, ...],
+    defining_only: bool,
+    required_sources: tuple[str, ...],
+    preferred_sources: tuple[str, ...],
+) -> str | None:
+    """Build the v2 ``filter`` query parameter from its parts.
+
+    The syntax is the undocumented ``V2FilterDto`` mini-language of
+    EBISPOT/zooma2, e.g.
+    ``required:[gwas],preferred:[atlas],ontologies:[efo,hp],defining_only:[true]``.
+    Malformed filter strings are rejected by the server with a 400, so the
+    client assembles the string itself and rejects values it could not
+    represent faithfully.
+    """
+    parts: list[str] = []
+    if required_sources:
+        parts.append(f"required:[{_v2_filter_values('required_sources', required_sources)}]")
+    if preferred_sources:
+        parts.append(f"preferred:[{_v2_filter_values('preferred_sources', preferred_sources)}]")
+    if targets:
+        parts.append(f"ontologies:[{_v2_filter_values('target_ontologies', targets)}]")
+    if defining_only:
+        parts.append("defining_only:[true]")
+    return ",".join(parts) if parts else None
 
 
 class Client:
@@ -421,19 +465,60 @@ class Client:
 
     # --- v2 annotate -------------------------------------------------------
 
-    def annotate(self, value: str) -> list[models.Annotation]:
+    def annotate(
+        self,
+        value: str,
+        *,
+        property_type: str | None = None,
+        target_ontologies: Sequence[str] = (),
+        defining_only: bool = False,
+        required_sources: Sequence[str] = (),
+        preferred_sources: Sequence[str] = (),
+    ) -> list[models.Annotation]:
         """Annotate a single value via the legacy v2 annotate endpoint.
 
         The endpoint accepts exactly one ``propertyValue`` per call and
-        silently ignores every other query parameter, so there is no way
-        to batch several values into one request — use
-        :meth:`annotate_all` for that; its ``batch_size`` only groups
-        values for retry/skip purposes and does not reduce the number of
-        requests.
+        silently ignores unknown query parameters, so there is no way to
+        batch several values into one request — use :meth:`annotate_all`
+        for that; its ``batch_size`` only groups values for retry/skip
+        purposes and does not reduce the number of requests.
+
+        Results can be restricted through the endpoint's ``filter``
+        parameter (undocumented publicly; the contract is the
+        ``V2FilterDto`` parser in EBISPOT/zooma2, verified live):
+
+        * ``target_ontologies`` — ontology names (e.g. ``["efo", "hp"]``).
+          Unlike v3's fail-open ``targetOntologies``, this is a *hard*
+          filter: the server translates it to the same restricted
+          combination :meth:`map_all` sends. The returned annotations are
+          verified against it (:class:`FilterViolation` otherwise), and
+          note that a filter can *increase* the result count — a set
+          filter triggers the server's deep search when the shallow
+          search misses the target ontology.
+        * ``defining_only`` — restrict to the ontologies' own namespaces
+          (exclude terms they import); only meaningful together with
+          ``target_ontologies``.
+        * ``required_sources`` / ``preferred_sources`` — restrict or
+          prefer curated datasources (e.g. ``"gwas"``). These do not
+          affect ontology-backed matches.
 
         No retry policy is applied here; failures raise directly.
         """
-        payload = self._request_json("GET", ANNOTATE_PATH, params={"propertyValue": value})
+        targets = tuple(target_ontologies)
+        required = tuple(required_sources)
+        filter_raw = _build_v2_filter(
+            targets=targets,
+            defining_only=defining_only,
+            required_sources=required,
+            preferred_sources=tuple(preferred_sources),
+        )
+        params: dict[str, str] = {"propertyValue": value}
+        if property_type is not None:
+            params["propertyType"] = property_type
+        if filter_raw is not None:
+            params["filter"] = filter_raw
+
+        payload = self._request_json("GET", ANNOTATE_PATH, params=params)
         if isinstance(payload, dict):
             items: list[Any] = [payload]
         elif isinstance(payload, list):
@@ -450,13 +535,53 @@ class Client:
                     f"ZOOMA annotate returned a non-object annotation for value {value!r}"
                 )
             annotations.append(models.Annotation.from_dict(item))
+        if targets:
+            self._check_annotation_filter(annotations, targets, required)
         return annotations
+
+    def _check_annotation_filter(
+        self,
+        annotations: list[models.Annotation],
+        targets: tuple[str, ...],
+        required_sources: tuple[str, ...],
+    ) -> None:
+        """Verify a hard ontology filter was applied (§"fails open" guard).
+
+        A v2 response names each annotation's ontology in
+        ``derivedFrom.provenance.source.name``; curated matches carry the
+        datasource name instead, which is allowed when it was named in
+        ``required_sources``.
+        """
+        allowed = {target.lower() for target in targets}
+        allowed |= {source.lower() for source in required_sources}
+        violations = sorted(
+            {
+                derived.provenance.source.name.lower()
+                for annotation in annotations
+                for derived in annotation.derived_from
+                if derived.provenance
+                and derived.provenance.source
+                and derived.provenance.source.name
+                and derived.provenance.source.name.lower() not in allowed
+            }
+        )
+        if violations:
+            raise FilterViolation(
+                f"ZOOMA annotate returned annotations from ontologies outside "
+                f"the requested set {sorted(targets)}: {violations}. The v2 "
+                "ontologies filter was not applied."
+            )
 
     def annotate_all(
         self,
         values: Sequence[str],
         *,
         batch_size: int = 10,
+        property_type: str | None = None,
+        target_ontologies: Sequence[str] = (),
+        defining_only: bool = False,
+        required_sources: Sequence[str] = (),
+        preferred_sources: Sequence[str] = (),
         on_error: OnError = "skip",
     ) -> Iterator[models.Annotation]:
         """Annotate values via the legacy v2 endpoint, one request per value.
@@ -466,6 +591,10 @@ class Client:
         groups values that are retried and skipped together. Values are
         cached, so a retried batch re-queries only what is still missing
         and duplicate values are queried exactly once.
+
+        The filter options (``property_type``, ``target_ontologies``,
+        ``defining_only``, ``required_sources``, ``preferred_sources``)
+        are passed through to every request; see :meth:`annotate`.
 
         Yields one :class:`~zooma_client.models.Annotation` per
         (value, annotation) pair, in submission order; a value with no
@@ -480,7 +609,14 @@ class Client:
         def operation(batch: list[str]) -> list[list[models.Annotation]]:
             for value in batch:
                 if value not in cache:
-                    cache[value] = self.annotate(value)
+                    cache[value] = self.annotate(
+                        value,
+                        property_type=property_type,
+                        target_ontologies=target_ontologies,
+                        defining_only=defining_only,
+                        required_sources=required_sources,
+                        preferred_sources=preferred_sources,
+                    )
             return [cache[value] for value in batch]
 
         for batch_result in self._process_batches(

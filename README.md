@@ -69,6 +69,10 @@ for mapping in client.map_all(["body mass index", "asthma"], target_ontologies=[
 
 for annotation in client.annotate_all(["asthma", "lung cancer"]):
     print(annotation.property.property_value, annotation.semantic_tags, annotation.confidence)
+
+# Ontology selection also works in annotate mode (v2 `filter` parameter):
+for annotation in client.annotate("asthma", target_ontologies=["efo"], defining_only=True):
+    print(annotation.semantic_tags, annotation.confidence)
 ```
 
 `map_all` and `annotate_all` are lazy iterators yielding one result group
@@ -108,10 +112,28 @@ client = Client(
 ## Notes on the v2 annotate endpoint
 
 `annotate()` accepts a single `propertyValue` per call and silently ignores
-every other query parameter, so there is no request batching at that level.
+*unknown* query parameters, so there is no request batching at that level.
 `annotate_all(batch_size=...)` therefore only groups values for
 retry/skip purposes; the values are cached, so a retried batch re-queries
 only what is still missing and duplicates are queried exactly once.
+
+Ontology selection **is** supported in annotate mode, through the endpoint's
+`filter` query parameter (undocumented publicly; the contract is the
+`V2FilterDto` parser in `EBISPOT/zooma2`). The client exposes it as
+structured options on `annotate()` / `annotate_all()`:
+
+- `target_ontologies=["efo", "hp"]` — a **hard** ontology filter (unlike
+  v3, this does not fail open). Returned annotations are verified against
+  the requested set (`FilterViolation` otherwise).
+- `defining_only=True` — restrict to the ontologies' own namespaces,
+  excluding terms they import.
+- `required_sources=["gwas"]` / `preferred_sources=["atlas"]` — restrict
+  or prefer curated datasources (no effect on ontology-backed matches).
+
+Two quirks to know: a set ontology filter can *increase* the result count,
+because it triggers the server's deep search when the shallow search
+misses the target ontology; and `ontologies:[none]` is a legacy sentinel
+meaning "no restriction" (not exposed — simply omit the option).
 
 ## Development
 

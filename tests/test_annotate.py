@@ -1,11 +1,13 @@
-"""Annotate mode: single-value v2 calls, caching, retry grouping (Phase 4)."""
+"""Annotate mode: single-value v2 calls, caching, retry grouping (Phase 4),
+plus the v2 ``filter`` parameter (ontology selection)."""
 
 import re
+from urllib.parse import quote
 
 import pytest
 import responses
 
-from zooma_client import Client, ServiceUnavailableError
+from zooma_client import Client, FilterViolation, InvalidRequestError, ServiceUnavailableError
 
 BASE = "https://zooma.test"
 ANNOTATE_URL = f"{BASE}/v2/api/services/annotate"
@@ -127,6 +129,103 @@ def test_annotate_all_aborts_after_consecutive_failures():
 def test_annotate_all_empty_result_yields_nothing():
     responses.get(f"{ANNOTATE_URL}?propertyValue=a", json=[])
     assert list(Client(base_url=BASE).annotate_all(["a"])) == []
+
+
+# --- v2 filter: ontology selection -------------------------------------------
+
+
+@responses.activate
+def test_annotate_target_ontologies_sends_hard_filter(load_fixture):
+    # The v2 filter syntax is undocumented; the URL is the encoded
+    # `filter=ontologies:[efo]` query parameter.
+    url = f"{ANNOTATE_URL}?propertyValue=asthma&filter={quote('ontologies:[efo]')}"
+    responses.get(url, json=load_fixture("annotate_asthma_efo.json"))
+
+    annotations = Client(base_url=BASE).annotate("asthma", target_ontologies=["efo"])
+
+    assert len(responses.calls) == 1
+    assert responses.calls[0].request.url == url
+    assert len(annotations) == 75
+    # A hard filter: every annotation comes from the requested ontology.
+    sources = {
+        derived.provenance.source.name
+        for annotation in annotations
+        for derived in annotation.derived_from
+    }
+    assert sources == {"efo"}
+
+
+@responses.activate
+def test_annotate_filter_combination_builds_expected_query():
+    expected_filter = quote(
+        "required:[gwas],preferred:[atlas],ontologies:[efo,hp],defining_only:[true]"
+    )
+    url = (
+        f"{ANNOTATE_URL}?propertyValue=asthma&propertyType=organism"
+        f"&filter={expected_filter}"
+    )
+    responses.get(url, json=[])
+
+    Client(base_url=BASE).annotate(
+        "asthma",
+        property_type="organism",
+        target_ontologies=["efo", "hp"],
+        defining_only=True,
+        required_sources=["gwas"],
+        preferred_sources=["atlas"],
+    )
+
+    assert len(responses.calls) == 1
+    assert responses.calls[0].request.url == url
+
+
+@responses.activate
+def test_annotate_filter_violation_raises():
+    # The unfiltered payload carries 15 different ontology sources; asking
+    # for efo only must not silently return them.
+    responses.get(
+        f"{ANNOTATE_URL}?propertyValue=asthma&filter={quote('ontologies:[efo]')}",
+        json=[annotation("asthma", source="mondo")],
+    )
+    with pytest.raises(FilterViolation, match="outside the requested set"):
+        Client(base_url=BASE).annotate("asthma", target_ontologies=["efo"])
+
+
+@responses.activate
+def test_annotate_required_sources_are_allowed_alongside_targets():
+    # Curated matches keep their datasource name in the response; a
+    # violation check must allow sources named in required_sources.
+    responses.get(
+        f"{ANNOTATE_URL}?propertyValue=asthma&filter={quote('required:[gwas],ontologies:[efo]')}",
+        json=[annotation("asthma", source="gwas"), annotation("asthma", source="efo")],
+    )
+    annotations = Client(base_url=BASE).annotate(
+        "asthma", target_ontologies=["efo"], required_sources=["gwas"]
+    )
+    assert len(annotations) == 2
+
+
+@pytest.mark.parametrize("bad", ["ef,o", "fo]o", "fo[o"])
+def test_annotate_filter_rejects_unrepresentable_values(bad):
+    with pytest.raises(InvalidRequestError, match="v2 filter syntax"):
+        Client(base_url=BASE).annotate("asthma", target_ontologies=[bad])
+    with pytest.raises(InvalidRequestError, match="v2 filter syntax"):
+        Client(base_url=BASE).annotate("asthma", required_sources=[bad])
+
+
+@responses.activate
+def test_annotate_all_passes_filter_to_every_call(load_fixture):
+    url = f"{ANNOTATE_URL}?propertyValue=a&filter={quote('ontologies:[efo]')}"
+    responses.get(url, json=load_fixture("annotate_asthma_efo.json"))
+
+    annotations = list(
+        Client(base_url=BASE).annotate_all(["a", "a"], batch_size=1, target_ontologies=["efo"])
+    )
+
+    assert len(responses.calls) == 1  # duplicate served from the cache
+    # Both values still yield their annotations: 2 x 75.
+    assert len(annotations) == 150
+    assert "filter=ontologies" in responses.calls[0].request.url
 
 
 @responses.activate
