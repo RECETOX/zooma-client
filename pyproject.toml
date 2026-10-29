@@ -34,6 +34,13 @@ dev = [
     "ruff",
 ]
 
+[dependency-groups]
+dev = [
+    "pytest",
+    "responses",
+    "ruff",
+]
+
 [project.urls]
 Homepage = "https://github.com/RECETOX/zooma-client"
 Repository = "https://github.com/RECETOX/zooma-client"
